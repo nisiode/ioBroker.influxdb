@@ -23,12 +23,10 @@ var errorPoints         = {};
 var tasksStart          = [];
 var connected           = null;
 var finished            = false;
-var aliasMap   = {};
 
 var adapter = utils.Adapter('influxdb');
 
 adapter.on('objectChange', function (id, obj) {
-    var formerAliasId = aliasMap[id] ? aliasMap[id] : id;
     if (obj && obj.common &&
         (
             // todo remove history sometime (2016.08) - Do not forget object selector in io-package.json
@@ -36,38 +34,21 @@ adapter.on('objectChange', function (id, obj) {
             (obj.common.custom  && obj.common.custom[adapter.namespace]  && obj.common.custom[adapter.namespace].enabled)
         )
     ) {
-        var realId = id;
-        var checkForRemove = true;
-        if (obj.common.custom && obj.common.custom[adapter.namespace] && obj.common.custom[adapter.namespace].aliasId) {
-            if (obj.common.custom[adapter.namespace].aliasId !== id) {
-                aliasMap[id] = obj.common.custom[adapter.namespace].aliasId;
-                adapter.log.debug('Registered Alias: ' + id + ' --> ' + aliasMap[id]);
-                id = aliasMap[id];
-                checkForRemove = false;
-            }
-            else {
-                adapter.log.warn('Ignoring Alias-ID because identical to ID for ' + id);
-                obj.common.custom[adapter.namespace].aliasId = '';
-            }
-        }
-        if (checkForRemove && aliasMap[id]) {
-            adapter.log.debug('Removed Alias: ' + id + ' !-> ' + aliasMap[id]);
-            delete aliasMap[id];
-        }
 
-        if (!influxDPs[formerAliasId] && !subscribeAll) {
+        if (!influxDPs[id] && !subscribeAll) {
             // unsubscribe
             for (var _id in influxDPs) {
-                adapter.unsubscribeForeignStates(influxDPs[_id].realId);
+                adapter.unsubscribeForeignStates(_id);
             }
             subscribeAll = true;
             adapter.subscribeForeignStates('*');
         }
-        if (influxDPs[formerAliasId] && influxDPs[formerAliasId].relogTimeout) clearTimeout(influxDPs[formerAliasId].relogTimeout);
+        if (influxDPs[id] && influxDPs[id].relogTimeout) clearTimeout(influxDPs[id].relogTimeout);
 
         // todo remove history sometime (2016.08)
         influxDPs[id] = obj.common.custom || obj.common.history;
-        influxDPs[id].realId  = realId;
+        adapter.log.debug('influxDPs[id]' + JSON.stringify(influxDPs[id]));
+
         if (influxDPs[id][adapter.namespace].retention !== undefined && influxDPs[id][adapter.namespace].retention !== null && influxDPs[id][adapter.namespace].retention !== '') {
             influxDPs[id][adapter.namespace].retention = parseInt(influxDPs[id][adapter.namespace].retention || adapter.config.retention, 10) || 0;
         } else {
@@ -96,15 +77,46 @@ adapter.on('objectChange', function (id, obj) {
             influxDPs[id][adapter.namespace].retention += 86400;
         }
 
+        if(!influxDPs[id][adapter.namespace].measurement || !influxDPs[id][adapter.namespace].tags || !influxDPs[id][adapter.namespace].name){
+            var tmp = {};
+            tmp.common = {};
+            tmp.common.custom = {};
+            tmp.common.custom[adapter.namespace] = {};
+            
+            var split = id.split('.');
+            var tag_adapter = split[0];
+            var tag_instance = split[1];
+            var tag_id = id.substr(split[0].length + 1 + split[1].length + 1);
+            var tag_name = influxDPs[id][adapter.namespace].name;
+
+            if(!tag_name){
+                tag_name = obj.common.name;
+                tmp.common.custom[adapter.namespace].name = tag_name;
+            }
+            influxDPs[id][adapter.namespace].tags = {adapter: tag_adapter, instance: tag_instance, id: tag_id, name: tag_name};
+            tmp.common.custom[adapter.namespace].tags = influxDPs[id][adapter.namespace].tags;
+
+            if(!influxDPs[id][adapter.namespace].measurement){
+                influxDPs[id][adapter.namespace].measurement = obj.common.role;
+                tmp.common.custom[adapter.namespace].measurement = influxDPs[id][adapter.namespace].measurement;
+            }
+            
+            adapter.extendForeignObject(id, tmp, function (err) {
+                if (err) {
+                    adapter.log.error('error updating history config for ' + id + ' to pin additional info: ' + err);
+                } else {
+                    adapter.log.info('changed history configuration to pin additional info for ' + id);
+                }
+            });
+
+            adapter.log.debug('measurement set to: ' + influxDPs[id][adapter.namespace].measurement);
+            adapter.log.debug('tags set to: ' + influxDPs[id][adapter.namespace].tags);
+        }
+
         writeInitialValue(id);
 
-        adapter.log.info('enabled logging of ' + id + ', Alias=' + (id !== realId));
+        adapter.log.info('enabled logging of ' + id);
     } else {
-        if (aliasMap[id]) {
-            adapter.log.debug('Removed Alias: ' + id + ' !-> ' + aliasMap[id]);
-            delete aliasMap[id];
-        }
-        id = formerAliasId;
         if (influxDPs[id]) {
             if (influxDPs[id].relogTimeout) clearTimeout(influxDPs[id].relogTimeout);
             if (influxDPs[id].timeout) clearTimeout(influxDPs[id].timeout);
@@ -115,7 +127,6 @@ adapter.on('objectChange', function (id, obj) {
 });
 
 adapter.on('stateChange', function (id, state) {
-    id = aliasMap[id] ? aliasMap[id] : id;
     pushHistory(id, state);
 });
 
@@ -416,19 +427,14 @@ function main() {
                 for (var i = 0, l = doc.rows.length; i < l; i++) {
                     if (doc.rows[i].value) {
                         var id = doc.rows[i].id;
-                        var realId = id;
-                        if (doc.rows[i].value[adapter.namespace] && doc.rows[i].value[adapter.namespace].aliasId) {
-                            aliasMap[id] = doc.rows[i].value[adapter.namespace].aliasId;
-                            adapter.log.debug('Found Alias: ' + id + ' --> ' + aliasMap[id]);
-                            id = aliasMap[id];
-                        }
-                        influxDPs[id] = doc.rows[i].value;
 
+                        influxDPs[id] = doc.rows[i].value;
+                        
                         if (!influxDPs[id][adapter.namespace]) {
                             delete influxDPs[id];
                         } else {
                             count++;
-                            adapter.log.info('enabled logging of ' + id + ', Alias=' + (id !== realId) + ', ' + count + ' points now activated');
+                            adapter.log.info('enabled logging of ' + id + ', ' + count + ' points now activated');
                             if (influxDPs[id][adapter.namespace].retention !== undefined && influxDPs[id][adapter.namespace].retention !== null && influxDPs[id][adapter.namespace].retention !== '') {
                                 influxDPs[id][adapter.namespace].retention = parseInt(influxDPs[id][adapter.namespace].retention || adapter.config.retention, 10) || 0;
                             } else {
@@ -460,7 +466,6 @@ function main() {
                                 influxDPs[id][adapter.namespace].retention += 86400;
                             }
 
-                            influxDPs[id].realId  = realId;
                             writeInitialValue(id);
                         }
                     }
@@ -470,7 +475,7 @@ function main() {
             if (count < 20) {
                 for (var _id in influxDPs) {
                     if (influxDPs.hasOwnProperty(_id)) {
-                        adapter.subscribeForeignStates(influxDPs[_id].realId);
+                        adapter.subscribeForeignStates(_id);
                     }
                 }
             } else {
@@ -601,7 +606,7 @@ function reLogHelper(_id) {
         pushHistory(_id, influxDPs[_id].state, true);
     }
     else {
-        adapter.getForeignState(influxDPs[_id].realId, function (err, state) {
+        adapter.getForeignState(_id, function (err, state) {
             if (err) {
                 adapter.log.info('init timed Relog: can not get State for ' + _id + ' : ' + err);
             }
@@ -699,10 +704,7 @@ function pushValueIntoDB(id, state, cb) {
     //adapter.log.debug('write value ' + state.val + ' for ' + id);
     var influxFields = {
         value: state.val,
-        time:  new Date(state.ts),
-        from:  state.from,
-        q:     state.q,
-        ack:   !!state.ack
+        time:  new Date(state.ts)
     };
 
     if ((conflictingPoints[id] || (adapter.config.seriesBufferMax === 0)) && (client.request) && (client.request.getHostsAvailable().length > 0)) {
@@ -719,7 +721,11 @@ function addPointToSeriesBuffer(id, stateObj, cb) {
     if (!seriesBuffer[id]) {
         seriesBuffer[id] = [];
     }
-    seriesBuffer[id].push([stateObj]);
+
+    var tags = influxDPs[id][adapter.namespace].tags;
+    var measurement = influxDPs[id][adapter.namespace].measurement;
+
+    seriesBuffer[measurement].push([stateObj, tags]);
     seriesBufferCounter++;
     if ((seriesBufferCounter > adapter.config.seriesBufferMax) && (client.request) && (client.request.getHostsAvailable().length > 0) && (!seriesBufferFlushPlanned)) {
         // flush out
@@ -764,6 +770,7 @@ function storeBufferedSeries(cb) {
 }
 
 function writeAllSeriesAtOnce(series, cb) {
+    //todo nag
     client.writeSeries(series, function (err /* , result */) {
         if (err) {
             adapter.log.warn('Error on writeSeries: ' + err);
@@ -811,6 +818,7 @@ function writeSeriesPerID(seriesId, points) {
         writeSeriesPerID(seriesId, points.slice(0, 15000));
         writeSeriesPerID(seriesId, points.slice(15000));
     } else {
+        //todo nag add tags to points
         client.writePoints(seriesId, points, function(err) {
             if (err) {
                 adapter.log.warn('Error on writePoints for ' + seriesId + ': ' + err);
@@ -841,85 +849,89 @@ function writePointsForID(seriesId, points) {
     }
 }
 
-function writeOnePointForID(pointId, point, directWrite, cb) {
+function writeOnePointForID(id, fields, directWrite, cb) {
     if (directWrite === undefined) {
         directWrite = false;
     }
-    client.writePoint(pointId, point, null, function (err /* , result */) {
+    var tags = influxDPs[id][adapter.namespace].tags;
+    var measurement = influxDPs[id][adapter.namespace].measurement;
+    adapter.log.debug('write measurement: ' + measurement + ' fields:' + JSON.stringify(fields) + ' tags:' + JSON.stringify(tags));
+
+    client.writePoint(measurement, fields, tags, function (err /* , result */) {
         if (err) {
-            adapter.log.warn('Error on writePoint("' + JSON.stringify(point) + '): ' + err + ' / ' + JSON.stringify(err.message));
+            adapter.log.warn('Error on writePoint("' + JSON.stringify(fields) + '): ' + err + ' / ' + JSON.stringify(err.message));
             if ((client.request.getHostsAvailable().length === 0) || (err.message && err.message === 'timeout')) {
                 setConnected(false);
-                addPointToSeriesBuffer(pointId, point);
+                addPointToSeriesBuffer(id, fields);
             } else if (err.message && (typeof err.message === 'string') && (err.message.indexOf('field type conflict') !== -1)) {
                 // retry write after type correction for some easy cases
                 var retry = false;
-                if (!influxDPs[pointId][adapter.namespace].storageType) {
+                if (!influxDPs[id][adapter.namespace].storageType) {
                     var convertDirection = '';
                     if (err.message.indexOf('is type bool, already exists as type float') !== -1 ||
                         err.message.indexOf('is type boolean, already exists as type float') !== -1) {
                         convertDirection = 'bool -> float';
-                        if (point.value === true) {
-                            point.value = 1;
+                        if (fields.value === true) {
+                            fields.value = 1;
                             retry = true;
                         }
-                        else if (point.value === false) {
-                            point.value = 0;
+                        else if (fields.value === false) {
+                            fields.value = 0;
                             retry = true;
                         }
-                        influxDPs[pointId][adapter.namespace].storageType = 'Number';
+                        influxDPs[id][adapter.namespace].storageType = 'Number';
                     }
                     else if ((err.message.indexOf('is type float, already exists as type bool') !== -1) || (err.message.indexOf('is type float64, already exists as type bool') !== -1)) {
                         convertDirection = 'float -> bool';
-                        if (point.value === 1) {
-                            point.value = true;
+                        if (fields.value === 1) {
+                            fields.value = true;
                             retry = true;
                         }
-                        else if (point.value === 0) {
-                            point.value = false;
+                        else if (fields.value === 0) {
+                            fields.value = false;
                             retry = true;
                         }
-                        influxDPs[pointId][adapter.namespace].storageType = 'Boolean';
+                        influxDPs[id][adapter.namespace].storageType = 'Boolean';
                     }
                     else if (err.message.indexOf(', already exists as type string') !== -1) {
-                        point.value = point.value.toString();
+                        fields.value = fields.value.toString();
                         retry = true;
-                        influxDPs[pointId][adapter.namespace].storageType = 'String';
+                        influxDPs[id][adapter.namespace].storageType = 'String';
                     }
                     if (retry) {
-                        adapter.log.info('Try to convert ' + convertDirection + ' and re-write for ' + pointId + ' and set storageType to ' + influxDPs[pointId][adapter.namespace].storageType);
-                        writeOnePointForID(pointId, point, true, cb);
+                        adapter.log.info('Try to convert ' + convertDirection + ' and re-write for ' + id + ' and set storageType to ' + influxDPs[id][adapter.namespace].storageType);
+                        writeOnePointForID(id, fields, true, cb);
                         var obj = {};
                         obj.common = {};
                         obj.common.custom = {};
                         obj.common.custom[adapter.namespace] = {};
-                        obj.common.custom[adapter.namespace].storageType = influxDPs[pointId][adapter.namespace].storageType;
-                        adapter.extendForeignObject(pointId, obj, function (err) {
+                        obj.common.custom[adapter.namespace].storageType = influxDPs[id][adapter.namespace].storageType;
+                        adapter.extendForeignObject(id, obj, function (err) {
                             if (err) {
-                                adapter.log.error('error updating history config for ' + pointId + ' to pin datatype: ' + err);
+                                adapter.log.error('error updating history config for ' + id + ' to pin datatype: ' + err);
                             } else {
-                                adapter.log.info('changed history configuration to pin detected datatype for ' + pointId);
+                                adapter.log.info('changed history configuration to pin detected datatype for ' + id);
                             }
                         });
                     }
                 }
                 if (!directWrite || !retry) {
                     // remember this as a pot. conflicting point and write synchronous
-                    conflictingPoints[pointId]=1;
-                    adapter.log.warn('Add ' + pointId + ' to conflicting Points (' + Object.keys(conflictingPoints).length + ' now)');
+                    conflictingPoints[id]=1;
+                    adapter.log.warn('Add ' + id + ' to conflicting Points (' + Object.keys(conflictingPoints).length + ' now)');
                 }
             } else {
-                if (! errorPoints[pointId]) {
-                    errorPoints[pointId] = 1;
+                if (! errorPoints[id]) {
+                    errorPoints[id] = 1;
                 } else {
-                    errorPoints[pointId]++;
+                    errorPoints[id]++;
                 }
-                if (errorPoints[pointId] < 10) {
+                if (errorPoints[id] < 10) {
                     // re-add that point to buffer to try write again
-                    adapter.log.info('Add point that had error for ' + pointId + ' to buffer again, error-count=' + errorPoints[pointId]);
-                    addPointToSeriesBuffer(pointId, point);
+                    adapter.log.info('Add point that had error for ' + id + ' to buffer again, error-count=' + errorPoints[id]);
+                    addPointToSeriesBuffer(id, errorPoints[id]);
                 } else {
-                    errorPoints[pointId] = 0;
+                    errorPoints[id] = 0;
                 }
             }
         } else {
@@ -1012,9 +1024,6 @@ function getHistory(msg) {
         ignoreNull: true,
         sessionId:  msg.message.options.sessionId
     };
-    if (options.id && aliasMap[options.id]) {
-        options.id = aliasMap[options.id];
-    }
     var query = 'SELECT';
     if (options.step) {
         switch (options.aggregate) {
@@ -1235,19 +1244,16 @@ function storeState(msg) {
     if (Array.isArray(msg.message)) {
         adapter.log.debug('storeState: store ' + msg.message.length + ' states for multiple ids');
         for (var i = 0; i < msg.message.length; i++) {
-            id = aliasMap[msg.message[i].id] ? aliasMap[msg.message[i].id] : msg.message[i].id;
-            pushValueIntoDB(id, msg.message[i].state);
+            pushValueIntoDB(msg.message[i].id, msg.message[i].state);
         }
     } else if (Array.isArray(msg.message.state)) {
         adapter.log.debug('storeState: store ' + msg.message.state.length + ' states for ' + msg.message.id);
         for (var j = 0; j < msg.message.state.length; j++) {
-            id = aliasMap[msg.message.id] ? aliasMap[msg.message.id] : msg.message.id;
-            pushValueIntoDB(id, msg.message.state[j]);
+            pushValueIntoDB(msg.message.id, msg.message.state[j]);
         }
     } else {
         adapter.log.debug('storeState: store 1 state for ' + msg.message.id);
-        id = aliasMap[msg.message.id] ? aliasMap[msg.message.id] : msg.message.id;
-        pushValueIntoDB(id, msg.message.state);
+        pushValueIntoDB(msg.message.id, msg.message.state);
     }
 
     adapter.sendTo(msg.from, msg.command, {
@@ -1323,7 +1329,7 @@ function getEnabledDPs(msg) {
     var data = {};
     for (var id in influxDPs) {
         if (!influxDPs.hasOwnProperty(id)) continue;
-        data[influxDPs[id].realId] = influxDPs[id][adapter.namespace];
+        data[id] = influxDPs[id][adapter.namespace];
     }
 
     adapter.sendTo(msg.from, msg.command, data, msg.callback);
